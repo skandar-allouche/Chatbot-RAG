@@ -1,0 +1,1 @@
+Ce projet consiste à développer un ChatBot en utilisant RAG
