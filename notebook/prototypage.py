@@ -1,4 +1,4 @@
-import google.generativeai as genai
+from google import genai
 import psycopg
 from psycopg import Cursor
 import os
@@ -8,7 +8,9 @@ import time
 data_folder = "../data/"
 
 # --- Configuration de l'API Gemini ---
-genai.configure(api_key="AIzaSyCU51GOJaUR-lUEF-IWcxr5t9dE65VuHN4")
+client = genai.Client(
+    api_key="AIzaSyBFNZ840CTgxh8LokapY8QNnyCYzhUVT4M",
+)
 
 # --- Connexion PostgreSQL ---
 db_connection_str = "dbname=rag_chatbot user=postgres password=postgres host=localhost port=5432"
@@ -17,8 +19,7 @@ db_connection_str = "dbname=rag_chatbot user=postgres password=postgres host=loc
 # 1) UTILITAIRES
 # -------------------------------------------------------
 
-def load_file(file_path: str) -> list[str]:
-    """Charge un fichier et extrait les lignes utiles."""
+def load_conversation(file_path: str) -> str:
     with open(file_path, "r", encoding="windows-1252", errors="ignore") as file:
         lines = file.read().split("\n")
 
@@ -27,16 +28,15 @@ def load_file(file_path: str) -> list[str]:
         for l in lines
         if l.strip() != "" and not l.startswith("<")
     ]
-    return cleaned
 
+    return "\n".join(cleaned)
 
 def calculate_embedding(text: str) -> list[float]:
-    """Génère un embedding avec Gemini."""
-    response = genai.embed_content(
+    response = client.models.embed_content(
         model="text-embedding-004",
-        content=text
+        contents=text
     )
-    return response["embedding"]
+    return response.embeddings[0].values
 
 
 def embedding_to_vector_str(embedding: list[float]) -> str:
@@ -48,19 +48,18 @@ def embedding_to_vector_str(embedding: list[float]) -> str:
 # 2) RECHERCHE VECTORIELLE
 # -------------------------------------------------------
 
-def search_similar(text: str, cur: Cursor, k: int = 5):
-    """Recherche les passages les plus proches via pgvector."""
-    query_emb = calculate_embedding(text)
+def search_similar_conversation(question: str, cur: Cursor):
+    query_emb = calculate_embedding(question)
     query_vector = embedding_to_vector_str(query_emb)
 
     cur.execute("""
-        SELECT corpus, embedding <=> %s::vector AS distance
-        FROM embeddings
-        ORDER BY distance ASC
-        LIMIT %s;
-    """, (query_vector, k))
+        SELECT conversation_id, content
+        FROM conversations
+        ORDER BY embedding <=> %s::vector
+        LIMIT 1;
+    """, (query_vector,))
 
-    return cur.fetchall()
+    return cur.fetchone()
 
 
 # -------------------------------------------------------
@@ -68,22 +67,28 @@ def search_similar(text: str, cur: Cursor, k: int = 5):
 # -------------------------------------------------------
 
 def generate_answer(question: str, context: str) -> str:
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=f"""
+        Tu es un assistant intelligent chargé d’analyser une conversation téléphonique.
 
-    response = model.generate_content(
-        f"""
-        Tu es un chatbot intelligent. Voici le contexte trouvé :
+        Règles :
+        - Le contexte est une conversation complète.
+        - "c:" = client, "h:" = hôtesse.
+        - Réponds en déduisant l'information à partir de la conversation.
+        - Ne répète pas la question.
+        - Ne reformule pas le contexte.
+        - Donne une réponse naturelle et humaine.
 
-        CONTEXTE :
+        CONVERSATION :
         {context}
 
         QUESTION :
         {question}
 
-        Réponds de manière claire, précise, et basée uniquement sur le contexte.
+        Réponse :
         """
-    )
-
+        )
     return response.text
 
 
@@ -95,47 +100,41 @@ with psycopg.connect(db_connection_str) as conn:
     conn.autocommit = True
     with conn.cursor() as cur:
 
-        print("🔄 Réinitialisation de la table...")
-
-        cur.execute("DROP TABLE IF EXISTS embeddings")
+        cur.execute("DROP TABLE IF EXISTS conversations")
         cur.execute("""
-            CREATE TABLE embeddings (
+            CREATE TABLE conversations (
                 id SERIAL PRIMARY KEY,
-                corpus TEXT,
+                conversation_id TEXT,
+                content TEXT,
                 embedding VECTOR(768)
             );
         """)
 
-        print("\n📁 Parcours du dossier :", data_folder)
+        print("📁 Indexation des conversations...")
 
         for filename in os.listdir(data_folder):
             if filename.endswith(".txt"):
-                file_path = os.path.join(data_folder, filename)
-                print(f"\n📄 Processing: {file_path}")
+                path = os.path.join(data_folder, filename)
 
-                lines = load_file(file_path)
-                print(f" → {len(lines)} lignes détectées")
+                conversation_text = load_conversation(path)
+                embedding = calculate_embedding(conversation_text)
+                vector_str = embedding_to_vector_str(embedding)
 
-                for line in lines:
-                    embedding = calculate_embedding(line)
-                    vector_str = embedding_to_vector_str(embedding)
+                cur.execute("""
+                    INSERT INTO conversations (conversation_id, content, embedding)
+                    VALUES (%s, %s, %s::vector)
+                """, (filename, conversation_text, vector_str))
 
-                    cur.execute(
-                        """INSERT INTO embeddings (corpus, embedding)
-                           VALUES (%s, %s::vector)""",
-                        (line, vector_str)
-                    )
+                time.sleep(0.05)
 
-                    time.sleep(0.05)
-
-        print("\n🎉 Tous les fichiers ont été entièrement indexés !")
+        print("✅ Indexation terminée")
 
 
 # -------------------------------------------------------
 # 5) CHATBOT RAG INTERACTIF
 # -------------------------------------------------------
 
-print("\n🤖 Chatbot RAG prêt ! Pose une question (or 'exit'): ")
+print("\n🤖 Chatbot RAG prêt ! (exit pour quitter)")
 
 with psycopg.connect(db_connection_str) as conn:
     with conn.cursor() as cur:
@@ -144,16 +143,17 @@ with psycopg.connect(db_connection_str) as conn:
             question = input("\n🧑‍💻 Vous : ")
 
             if question.lower() == "exit":
-                print("👋 Fin du chatbot.")
                 break
 
-            print("🔍 Recherche dans la base...")
+            conv = search_similar_conversation(question, cur)
 
-            results = search_similar(question, cur, k=5)
-            context = "\n".join([row[0] for row in results])
+            if not conv:
+                print("🤖 Chatbot : Aucune conversation pertinente trouvée.")
+                continue
 
-            print("\n📚 Contexte récupéré :")
-            print(context)
+            conv_id, context = conv
+
+            print(f"\n📚 Conversation trouvée : {conv_id}")
 
             answer = generate_answer(question, context)
 
