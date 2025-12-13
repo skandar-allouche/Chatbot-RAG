@@ -19,6 +19,7 @@ db_connection_str = "dbname=rag_chatbot user=postgres password=postgres host=loc
 # 1) UTILITAIRES
 # -------------------------------------------------------
 
+# cette fonction charge et nettoie une conversation depuis un fichier txt
 def load_conversation(file_path: str) -> str:
     with open(file_path, "r", encoding="windows-1252", errors="ignore") as file:
         lines = file.read().split("\n")
@@ -31,6 +32,7 @@ def load_conversation(file_path: str) -> str:
 
     return "\n".join(cleaned)
 
+# cette fonction calcule l'embedding d'un texte avec Gemini ( text-embedding-004 )
 def calculate_embedding(text: str) -> list[float]:
     response = client.models.embed_content(
         model="text-embedding-004",
@@ -38,7 +40,7 @@ def calculate_embedding(text: str) -> list[float]:
     )
     return response.embeddings[0].values
 
-
+# cette fonction convertit une liste Python en format pgvector
 def embedding_to_vector_str(embedding: list[float]) -> str:
     """Convertit une liste Python → format pgvector."""
     return "[" + ",".join(map(str, embedding)) + "]"
@@ -48,6 +50,7 @@ def embedding_to_vector_str(embedding: list[float]) -> str:
 # 2) RECHERCHE VECTORIELLE
 # -------------------------------------------------------
 
+# cette fonction recherche la conversation la plus similaire à la question ( pour donner du contexte au chatbot )
 def search_similar_conversation(question: str, cur: Cursor):
     query_emb = calculate_embedding(question)
     query_vector = embedding_to_vector_str(query_emb)
@@ -66,6 +69,7 @@ def search_similar_conversation(question: str, cur: Cursor):
 # 3) RÉPONSE DU CHATBOT (GEMINI)
 # -------------------------------------------------------
 
+# génère une réponse à la question en utilisant le contexte de la conversation trouvée
 def generate_answer(question: str, context: str) -> str:
     response = client.models.generate_content(
         model="gemini-2.5-flash",
@@ -96,6 +100,7 @@ def generate_answer(question: str, context: str) -> str:
 # 4) INDEXATION DES FICHIERS (À FAIRE UNE SEULE FOIS)
 # -------------------------------------------------------
 
+# Indexation des conversations dans la base de données PostgreSQL avec pgvector
 with psycopg.connect(db_connection_str) as conn:
     conn.autocommit = True
     with conn.cursor() as cur:
@@ -134,6 +139,7 @@ with psycopg.connect(db_connection_str) as conn:
 # 5) CHATBOT RAG INTERACTIF
 # -------------------------------------------------------
 
+# Boucle interactive pour poser des questions au chatbot
 print("\n🤖 Chatbot RAG prêt ! (exit pour quitter)")
 
 with psycopg.connect(db_connection_str) as conn:
